@@ -204,4 +204,63 @@ function generatePagination($currentPage, $totalPages, $baseUrl, $queryParams = 
 
     echo '</ul></nav>';
 }
+define('CACHE_DIR', __DIR__ . '/../cache/'); // Buat folder 'cache' di root project
+define('CACHE_DEFAULT_TTL', 3600); // Durasi cache default (detik), misal 1 jam
+
+/**
+ * Mendapatkan data dari cache file.
+ * @param string $key Kunci unik untuk cache.
+ * @param int|null $ttl Time-to-live (detik). Null = default.
+ * @return mixed Data dari cache atau false jika tidak ada/kadaluarsa.
+ */
+function get_from_cache($key, $ttl = null) {
+    if (!is_dir(CACHE_DIR)) {
+        mkdir(CACHE_DIR, 0775, true);
+    }
+    $filename = CACHE_DIR . md5($key) . '.cache';
+    $ttl = $ttl ?? CACHE_DEFAULT_TTL;
+
+    if (file_exists($filename)) {
+        $mtime = filemtime($filename);
+        if (time() - $mtime < $ttl) {
+            $content = file_get_contents($filename);
+            if ($content !== false) {
+                $data = @unserialize($content);
+                if ($data !== false) {
+                    return $data; // Cache hit!
+                }
+            }
+        } else {
+            @unlink($filename); // Hapus cache kadaluarsa
+        }
+    }
+    return false; // Cache miss atau error
+}
+
+/**
+ * Menyimpan data ke cache file.
+ * @param string $key Kunci unik untuk cache.
+ * @param mixed $data Data yang akan disimpan.
+ * @return bool True jika berhasil.
+ */
+function save_to_cache($key, $data) {
+    if (!is_dir(CACHE_DIR)) {
+        if (!mkdir(CACHE_DIR, 0775, true)) {
+             error_log("Gagal membuat direktori cache: " . CACHE_DIR);
+             return false;
+        }
+    }
+     if (!is_writable(CACHE_DIR)) {
+        error_log("Direktori cache tidak bisa ditulis: " . CACHE_DIR);
+        return false;
+    }
+    $filename = CACHE_DIR . md5($key) . '.cache';
+    $serialized_data = serialize($data);
+    if (file_put_contents($filename, $serialized_data) !== false) {
+        return true;
+    } else {
+         error_log("Gagal menulis ke file cache: " . $filename);
+        return false;
+    }
+}
 ?>
