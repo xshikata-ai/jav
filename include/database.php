@@ -207,98 +207,106 @@ function updateClonedVideo($id, $data) {
 
 function getVideosFromDB($limit = 12, $offset = 0, $searchKeyword = '', $categoryId = null, $tag = null, $orderBy = 'cloned_at', $orderDirection = 'DESC') {
     $conn = connectDB();
-    // Tambahkan score untuk relevansi pencarian
     $selectFields = "v.*, c.name as category_name, c.color_hex as category_color";
-    
-    $sql = "SELECT {$selectFields}
-            FROM videos v
-            LEFT JOIN categories c ON v.category_id = c.id";
     $params = [];
     $types = '';
     $whereClauses = [];
-
-    // --- LOGIKA PENCARIAN DIPERBARUI (Menggunakan LIKE untuk presisi judul) ---
     $orderByClause = "";
-    
-    if (!empty($searchKeyword)) {
-        // Kita akan mencari di judul, tag, dan aktris
-        $likeTerm = '%' . $conn->real_escape_string($searchKeyword) . '%';
-        $whereClauses[] = "(v.original_title LIKE ? OR v.tags LIKE ? OR v.actresses LIKE ?)";
-        
-        // Tambahkan parameter 3x
-        $params[] = $likeTerm;
-        $params[] = $likeTerm;
-        $params[] = $likeTerm;
-        $types .= 'sss';
-        
-        // Urutkan berdasarkan prioritas:
-        // 1. Judul TEPAT (atau dimulai dengan kode, misal "NKKD-123")
-        // 2. Judul mengandung kata kunci
-        // 3. Sisanya, urutkan berdasarkan ID (terbaru)
-        $orderByClause = "
-            CASE
-                WHEN v.original_title LIKE ? THEN 1  /* Prioritas 1: Judul dimulai dengan keyword */
-                WHEN v.original_title LIKE ? THEN 2  /* Prioritas 2: Judul mengandung keyword */
-                ELSE 3
-            END ASC, 
-            v.id DESC 
-        ";
-        
-        // Parameter untuk ORDER BY
-        $likeStartTerm = $conn->real_escape_string(trim($searchKeyword)) . '%';
-        $params[] = $likeStartTerm; // Untuk WHEN v.original_title LIKE ? (mulai dengan)
-        $params[] = $likeTerm;      // Untuk WHEN v.original_title LIKE ? (mengandung)
-        $types .= 'ss';
+    $isCodeSearch = false; // Tandai apakah ini pencarian kode spesifik
 
+    // --- LOGIKA HYBRID UNTUK PENCARIAN ---
+    if (!empty($searchKeyword)) {
+        $trimmedKeyword = trim($searchKeyword);
+        // Deteksi jika keyword adalah kode video spesifik (cth: ABC-123)
+        if (preg_match('/^[a-zA-Z]+-\d+$/', $trimmedKeyword)) {
+            $isCodeSearch = true;
+            // Gunakan LIKE yang lebih presisi untuk kode di awal judul
+            $whereClauses[] = "v.original_title LIKE ?";
+            $params[] = $trimmedKeyword . '%'; // Cari judul yang DIMULAI dengan kode
+            $types .= 's';
+            // Urutkan berdasarkan judul yang cocok dulu, baru ID terbaru
+            $orderByClause = " CASE WHEN v.original_title LIKE ? THEN 0 ELSE 1 END ASC, v.id DESC ";
+            $params[] = $trimmedKeyword . '%'; // Tambahkan parameter lagi untuk ORDER BY
+            $types .= 's';
+
+        } else {
+            // Jika bukan kode spesifik, gunakan Full-Text Search (Boolean Mode)
+            $selectFields .= ", MATCH(v.original_title, v.tags, v.actresses) AGAINST(? IN BOOLEAN MODE) as relevance";
+
+            // Buat boolean keyword (seperti sebelumnya)
+            $booleanKeyword = '';
+            $terms = explode(' ', $trimmedKeyword);
+            foreach ($terms as $term) { $term = trim($term); if (!empty($term)) { if (strlen($term) > 2 && !in_array(substr($term, 0, 1), ['-', '~'])) { $booleanKeyword .= '+' . $term . '* '; } else { $booleanKeyword .= $term . '* '; } } }
+            $booleanKeyword = trim($booleanKeyword);
+            // (Opsional: perkuat frasa jika mengandung '-' tapi BUKAN format kode pasti)
+             if (strpos($trimmedKeyword, '-') !== false && !$isCodeSearch && count($terms) === 1) {
+                 $booleanKeyword = '+' . $trimmedKeyword . '*';
+             }
+
+
+            // Parameter untuk SELECT relevance
+            $params[] = $booleanKeyword;
+            $types .= 's';
+
+            // Parameter untuk WHERE MATCH
+            $whereClauses[] = "MATCH(v.original_title, v.tags, v.actresses) AGAINST(? IN BOOLEAN MODE)";
+            $params[] = $booleanKeyword;
+            $types .= 's';
+
+            // Urutkan berdasarkan relevansi
+            $orderByClause = " relevance DESC, v.id DESC ";
+        }
     } else {
-        // Jika tidak ada pencarian, gunakan sorting yang diminta (latest, views, likes)
+        // Jika tidak ada pencarian, gunakan sorting biasa (tetap sama)
         $allowedOrderBy = ['cloned_at', 'views', 'likes', 'id'];
-        // Pastikan $orderBy aman
         if (in_array($orderBy, $allowedOrderBy)) {
              $orderByClause = " v.{$orderBy} ";
              $orderDirection = strtoupper($orderDirection) === 'ASC' ? 'ASC' : 'DESC';
              $orderByClause .= $orderDirection;
         } else {
-             $orderByClause = " v.id DESC "; // Fallback aman
+             $orderByClause = " v.id DESC ";
         }
     }
-    // --- AKHIR MODIFIKASI ---
+    // --- AKHIR LOGIKA HYBRID ---
 
+    // Filter Kategori dan Tag (Tetap Sama)
     if ($categoryId !== null && $categoryId > 0) {
         $whereClauses[] = "v.category_id = ?";
         $params[] = $categoryId;
         $types .= 'i';
     }
+    // Pertimbangkan index pada `tags` jika sering digunakan
     if ($tag !== null && !empty($tag)) {
         $whereClauses[] = "v.tags LIKE ?";
-        $params[] = '%' . $tag . '%';
+        $params[] = '%' . $conn->real_escape_string($tag) . '%';
         $types .= 's';
     }
+
+    // Bangun Query Utama
+    $sql = "SELECT {$selectFields}
+            FROM videos v
+            LEFT JOIN categories c ON v.category_id = c.id";
     if (!empty($whereClauses)) {
         $sql .= " WHERE " . implode(" AND ", $whereClauses);
     }
-    
-    // Terapkan klausa ORDER BY
     if (!empty($orderByClause)) {
         $sql .= " ORDER BY {$orderByClause}";
     }
-    
     $sql .= " LIMIT ? OFFSET ?";
     $params[] = $limit;
     $params[] = $offset;
     $types .= 'ii';
 
+    // Eksekusi Query (Tetap Sama)
     $stmt = $conn->prepare($sql);
     if ($stmt) {
-        if (!empty($params)) {
-            $stmt->bind_param($types, ...$params);
-        }
+        if (!empty($params)) { $stmt->bind_param($types, ...$params); }
         $stmt->execute();
         $result = $stmt->get_result();
         $videos = $result->fetch_all(MYSQLI_ASSOC);
         $stmt->close();
     } else {
-        error_log("Error menyiapkan pernyataan select: " . $conn->error);
+        error_log("Error preparing select videos: " . $conn->error . " SQL: " . $sql);
         $videos = [];
     }
     $conn->close();
@@ -504,18 +512,36 @@ function getTotalVideoCountDB($searchKeyword = '', $categoryId = null, $tag = nu
     $params = [];
     $types = '';
     $whereClauses = [];
+    $isCodeSearch = false; // Tandai apakah ini pencarian kode spesifik
 
-    // --- LOGIKA PENCARIAN DIPERBARUI (Cocokkan dengan getVideosFromDB) ---
+    // --- LOGIKA HYBRID UNTUK PENCARIAN (COUNT) ---
     if (!empty($searchKeyword)) {
-        $likeTerm = '%' . $conn->real_escape_string($searchKeyword) . '%';
-        $whereClauses[] = "(v.original_title LIKE ? OR v.tags LIKE ? OR v.actresses LIKE ?)";
-        $params[] = $likeTerm;
-        $params[] = $likeTerm;
-        $params[] = $likeTerm;
-        $types .= 'sss';
-    }
-    // ------------------------------------
+        $trimmedKeyword = trim($searchKeyword);
+         // Deteksi jika keyword adalah kode video spesifik
+        if (preg_match('/^[a-zA-Z]+-\d+$/', $trimmedKeyword)) {
+            $isCodeSearch = true;
+            // Gunakan LIKE yang lebih presisi
+            $whereClauses[] = "v.original_title LIKE ?";
+            $params[] = $trimmedKeyword . '%';
+            $types .= 's';
+        } else {
+            // Jika bukan kode spesifik, gunakan Full-Text Search (Boolean Mode)
+             $booleanKeyword = '';
+            $terms = explode(' ', $trimmedKeyword);
+            foreach ($terms as $term) { $term = trim($term); if (!empty($term)) { if (strlen($term) > 2 && !in_array(substr($term, 0, 1), ['-', '~'])) { $booleanKeyword .= '+' . $term . '* '; } else { $booleanKeyword .= $term . '* '; } } }
+            $booleanKeyword = trim($booleanKeyword);
+             if (strpos($trimmedKeyword, '-') !== false && !$isCodeSearch && count($terms) === 1) {
+                  $booleanKeyword = '+' . $trimmedKeyword . '*';
+             }
 
+            $whereClauses[] = "MATCH(v.original_title, v.tags, v.actresses) AGAINST(? IN BOOLEAN MODE)";
+            $params[] = $booleanKeyword;
+            $types .= 's';
+        }
+    }
+     // --- AKHIR LOGIKA HYBRID (COUNT) ---
+
+    // Filter Kategori dan Tag (Tetap Sama)
     if ($categoryId !== null && $categoryId > 0) {
         $whereClauses[] = "v.category_id = ?";
         $params[] = $categoryId;
@@ -523,17 +549,17 @@ function getTotalVideoCountDB($searchKeyword = '', $categoryId = null, $tag = nu
     }
     if ($tag !== null && !empty($tag)) {
         $whereClauses[] = "v.tags LIKE ?";
-        $params[] = '%' . $tag . '%';
+        $params[] = '%' . $conn->real_escape_string($tag) . '%';
         $types .= 's';
     }
+
+    // Bangun dan Eksekusi Query Count (Tetap Sama)
     if (!empty($whereClauses)) {
         $sql .= " WHERE " . implode(" AND ", $whereClauses);
     }
     $stmt = $conn->prepare($sql);
     if ($stmt) {
-        if (!empty($params)) {
-            $stmt->bind_param($types, ...$params);
-        }
+        if (!empty($params)) { $stmt->bind_param($types, ...$params); }
         $stmt->execute();
         $result = $stmt->get_result();
         $row = $result->fetch_assoc();
@@ -541,7 +567,7 @@ function getTotalVideoCountDB($searchKeyword = '', $categoryId = null, $tag = nu
         $conn->close();
         return $row['count'];
     } else {
-        error_log("Error menyiapkan pernyataan hitungan total: " . $conn->error);
+        error_log("Error preparing count total videos: " . $conn->error . " SQL: " . $sql);
         $conn->close();
         return 0;
     }
@@ -673,6 +699,17 @@ function deleteCategory($id) {
 }
 
 function getCategories($id = null) {
+    // Hanya cache jika mengambil SEMUA kategori (untuk menu)
+    if ($id === null) {
+        $cacheKey = 'all_categories_list';
+        // Cache selama 15 menit (900 detik)
+        $cachedCategories = get_from_cache($cacheKey, 900);
+        if ($cachedCategories !== false) {
+            return $cachedCategories;
+        }
+    }
+
+    // Jika id spesifik atau cache miss, ambil dari DB
     $conn = connectDB();
     if ($id) {
         $stmt = $conn->prepare("SELECT * FROM categories WHERE id = ?");
@@ -680,11 +717,16 @@ function getCategories($id = null) {
         $stmt->execute();
         $result = $stmt->get_result();
         $categories = $result->fetch_assoc();
+        $stmt->close(); // Tutup stmt di sini
     } else {
         $result = $conn->query("SELECT * FROM categories ORDER BY name ASC");
         $categories = $result->fetch_all(MYSQLI_ASSOC);
+        // Jika mengambil semua, simpan ke cache
+        if ($id === null && !empty($categories)) {
+            save_to_cache($cacheKey, $categories);
+        }
     }
-    $conn->close();
+    $conn->close(); // Tutup koneksi di sini
     return $categories;
 }
 
@@ -1171,6 +1213,14 @@ function addActressesIfNotExist(array $actressNames) {
 }
 
 function getUniqueTags() {
+    $cacheKey = 'unique_tags_list';
+    // Coba ambil dari cache dulu, cache selama 6 jam (21600 detik)
+    $cachedTags = get_from_cache($cacheKey, 21600);
+    if ($cachedTags !== false) {
+        return $cachedTags; // Kembalikan dari cache
+    }
+
+    // Jika tidak ada di cache, ambil dari DB
     $conn = connectDB();
     $result = $conn->query("SELECT tags FROM videos WHERE tags IS NOT NULL AND tags != ''");
     $allTags = [];
@@ -1181,10 +1231,23 @@ function getUniqueTags() {
         }
     }
     $conn->close();
-    return array_unique(array_filter($allTags));
+    $uniqueTags = array_unique(array_filter($allTags));
+
+    // Simpan ke cache sebelum mengembalikan
+    save_to_cache($cacheKey, $uniqueTags);
+
+    return $uniqueTags;
 }
 
 function getUniqueStudios() {
+    $cacheKey = 'unique_studios_list';
+    // Coba ambil dari cache dulu, cache selama 6 jam
+    $cachedStudios = get_from_cache($cacheKey, 21600);
+    if ($cachedStudios !== false) {
+        return $cachedStudios;
+    }
+
+    // Jika tidak ada di cache, ambil dari DB
     $conn = connectDB();
     $result = $conn->query("SELECT studios FROM videos WHERE studios IS NOT NULL AND studios != ''");
     $allStudios = [];
@@ -1195,7 +1258,12 @@ function getUniqueStudios() {
         }
     }
     $conn->close();
-    return array_unique(array_filter($allStudios));
+    $uniqueStudios = array_unique(array_filter($allStudios));
+
+    // Simpan ke cache
+    save_to_cache($cacheKey, $uniqueStudios);
+
+    return $uniqueStudios;
 }
 function createImportQueueTable() {
     $conn = connectDB();
@@ -1413,5 +1481,105 @@ function updateVideoCategoriesBulk(array $videoIds, $categoryId) {
     $stmt->close();
     $conn->close();
     return $success;
+}
+// --- Fungsi Baru untuk Sitemap Bertingkat ---
+
+/**
+ * Menghitung total video yang memiliki slug.
+ * @return int Total video.
+ */
+function getTotalVideoCountForSitemap() {
+    $conn = connectDB();
+    $sql = "SELECT COUNT(id) as count FROM videos WHERE slug IS NOT NULL";
+    $result = $conn->query($sql);
+    $total = $result ? $result->fetch_assoc()['count'] : 0;
+    $conn->close();
+    return (int)$total;
+}
+
+/**
+ * Mengambil slug video secara bertahap (batch).
+ * @param int $limit Jumlah data per batch.
+ * @param int $offset Posisi awal pengambilan data.
+ * @return array Daftar video ['slug' => '...', 'cloned_at' => '...']
+ */
+function getVideoSlugsForSitemap($limit, $offset) {
+    $conn = connectDB();
+    // Ambil cloned_at untuk <lastmod>
+    $sql = "SELECT slug, cloned_at FROM videos WHERE slug IS NOT NULL ORDER BY id DESC LIMIT ? OFFSET ?";
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param("ii", $limit, $offset);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $videos = $result->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+    } else {
+        error_log("Error preparing getVideoSlugsForSitemap: " . $conn->error);
+        $videos = [];
+    }
+    $conn->close();
+    return $videos;
+}
+
+
+/**
+ * Menghitung total aktris yang memiliki slug.
+ * @return int Total aktris.
+ */
+function getTotalActressCountForSitemap() {
+    $conn = connectDB();
+    $sql = "SELECT COUNT(id) as count FROM actresses WHERE slug IS NOT NULL";
+    $result = $conn->query($sql);
+    $total = $result ? $result->fetch_assoc()['count'] : 0;
+    $conn->close();
+    return (int)$total;
+}
+
+/**
+ * Mengambil slug aktris secara bertahap (batch).
+ * @param int $limit Jumlah data per batch.
+ * @param int $offset Posisi awal pengambilan data.
+ * @return array Daftar aktris ['slug' => '...']
+ */
+function getActressSlugsForSitemap($limit, $offset) {
+    $conn = connectDB();
+    $sql = "SELECT slug FROM actresses WHERE slug IS NOT NULL ORDER BY name ASC LIMIT ? OFFSET ?";
+    $stmt = $conn->prepare($sql);
+     if ($stmt) {
+        $stmt->bind_param("ii", $limit, $offset);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $actresses = $result->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+    } else {
+         error_log("Error preparing getActressSlugsForSitemap: " . $conn->error);
+        $actresses = [];
+    }
+    $conn->close();
+    return $actresses;
+}
+
+/**
+ * Mengambil semua slug kategori (biasanya tidak terlalu banyak, jadi tidak perlu batch).
+ * @return array Daftar kategori ['slug' => '...']
+ */
+function getCategorySlugsForSitemap() {
+    $conn = connectDB();
+    $sql = "SELECT slug FROM categories WHERE slug IS NOT NULL ORDER BY name ASC";
+    $result = $conn->query($sql);
+    $categories = $result ? $result->fetch_all(MYSQLI_ASSOC) : [];
+    $conn->close();
+    return $categories;
+}
+
+
+/**
+ * Mengambil semua tag unik (biasanya tidak terlalu banyak, jadi tidak perlu batch).
+ * @return array Daftar tag unik.
+ */
+function getUniqueTagsForSitemap() {
+    // Fungsi getUniqueTags() yang sudah ada bisa digunakan kembali
+    return getUniqueTags();
 }
 ?>
