@@ -20,12 +20,24 @@ if ($desktopCols == 6) {
     $videosToShowOnHomepage = 8;
 }
 
-$latestVideos = getVideosFromDB($videosToShowOnHomepage, 0, '', null, null, 'id', 'DESC');
-$popularVideos = getVideosFromDB($videosToShowOnHomepage, 0, '', null, null, 'views', 'DESC');
-$enable_border = getSetting('enable_category_border');
+$latestCacheKey = 'homepage_latest_videos_' . $videosToShowOnHomepage;
+$popularCacheKey = 'homepage_popular_videos_' . $videosToShowOnHomepage;
+$cacheTTL = 300; // Cache homepage selama 5 menit
 
-// TAMBAHKAN BARIS INI:
-$storyVideos = getVideosFromDB(8, 0, '', null, null, 'views', 'DESC'); // Ambil Top 5 Video Populer
+$latestVideos = get_from_cache($latestCacheKey, $cacheTTL);
+if ($latestVideos === false) {
+    $latestVideos = getVideosFromDB($videosToShowOnHomepage, 0, '', null, null, 'id', 'DESC');
+    save_to_cache($latestCacheKey, $latestVideos);
+}
+
+$popularVideos = get_from_cache($popularCacheKey, $cacheTTL);
+if ($popularVideos === false) {
+    $popularVideos = getVideosFromDB($videosToShowOnHomepage, 0, '', null, null, 'views', 'DESC');
+    save_to_cache($popularCacheKey, $popularVideos);
+}
+
+$enable_border = getSetting('enable_category_border');
+$storyVideos = getVideosFromDB(8, 0, '', null, null, 'views', 'DESC'); // Story mungkin tidak perlu di-cache seketat video utama
 
 require_once __DIR__ . '/templates/header.php';
 ?>
